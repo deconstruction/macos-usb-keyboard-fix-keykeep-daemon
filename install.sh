@@ -30,8 +30,8 @@ cat > "$APP/Contents/Info.plist" <<'INFO_EOF'
     <key>CFBundleIdentifier</key><string>local.keykeep.app</string>
     <key>CFBundleExecutable</key><string>keykeep</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.0.1</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>0.0.2</string>
+    <key>CFBundleVersion</key><string>2</string>
     <key>LSUIElement</key><true/>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
 </dict>
