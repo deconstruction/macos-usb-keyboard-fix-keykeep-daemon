@@ -79,11 +79,12 @@ INTERVAL=2 ./install.sh
 ## Commands
 
 ```
-keykeep poke [--interval 5] [--led | --key 71] [--log PATH]   keep-alive loop (default: --led)
-keykeep once                                                  one poke, prints what happened
+keykeep poke [--interval 5] [--backoff 60] [--led | --key 71] [--log PATH]   keep-alive loop
+keykeep once                                                  one poke, prints what happened and how long it took
+keykeep probe                                                 open every interface separately, with timings
 keykeep watch                                                 log attach/detach of the keyboard
-keykeep devices                                               list HID devices with VID/PID
-keykeep status                                                permissions, presence, running procs
+keykeep devices                                               list HID devices with usage page and LED elements
+keykeep status                                                permissions, presence, chosen interface
 keykeep perms                                                 ask for Input Monitoring
 ```
 
@@ -94,25 +95,44 @@ Two poke modes:
 | `--led` (default) | HID output report, toggles the NumLock LED | **yes** | Input Monitoring |
 | `--key 71` | injects the Clear/NumLock key event via `CGEvent` | no | Accessibility |
 
+## Which interface
+
+Cheap keyboards expose two HID interfaces: a keyboard one (usage page 1 / usage 6, three LED
+elements here) and a consumer-control one (usage page 12 / usage 1, no LED elements). The LED report
+only makes sense on the first. `keykeep` picks the interface by its LED output elements instead of
+taking the first one the manager returns — the order of a `Set` is arbitrary, and picking the
+consumer interface makes every poke fail for no visible reason. `keykeep probe` prints what was
+chosen and why.
+
 ## Reading the log
 
-`~/Library/Logs/keykeep.log`, one line a minute when everything is fine:
+`~/Library/Logs/keykeep.log`. State transitions are logged the moment they happen; a periodic
+line follows once a minute so the log shows the agent is alive.
 
 ```
-19:05:49  keykeep starting: every 5.0s -> LED report over USB
-19:05:49  tick 1: LED on
-19:06:50  tick 13: ok
+startup   keykeep starting: every 5.0s (backoff 60.0s) -> LED report over USB
+state     OK — LED on via usagePage 1/usage 6 (9 ms)
+state     keyboard DISAPPEARED from the bus
+state     OPEN FAILED — open failed 0xe00002c7 kIOReturnUnsupported (30012 ms)
+state     REPORT REJECTED — SetReport 0xe00002c7 kIOReturnUnsupported via usagePage 1/usage 6
+state     NO ACCESS — open denied 0xe00002e2 kIOReturnNotPermitted
 ```
 
-What the interesting lines mean:
+What they mean:
 
-* `keyboard DISAPPEARED from the bus` / `keyboard back on the bus` — the device re-enumerated. That is
-  a link-level drop; software cannot prevent it. Fix the hardware: a USB 2.0 hub between the Mac and
+* `keyboard DISAPPEARED from the bus` / `state: OK` afterwards — the device re-enumerated. That is a
+  link-level drop; software cannot prevent it. Fix the hardware: a USB 2.0 hub between the Mac and
   the keyboard is the most reliable option, then a better adapter/cable, then another port.
-* no such lines and the keyboard still freezes — the keyboard was sleeping on its own; the LED ping
-  is exactly what prevents that.
-* `no HID access (0xe00002e2)` — Input Monitoring is not granted to the binary that is running
-  (`kIOReturnNotPermitted`). Note that the grant is per code hash, not per path.
+* `OPEN FAILED` **with a large millisecond figure** — the device is on the bus but the open stalls and
+  fails. This is the device's own state, not permissions: the same binary opens it in 0 ms after a
+  replug. The agent then backs off to `--backoff` seconds instead of hammering a 30-second stall
+  every cycle.
+* `NO ACCESS — kIOReturnNotPermitted` — Input Monitoring is not granted. Note the grant is tied to
+  the **code hash**, so any rebuild silently revokes it: toggle the permission off and on again.
+* `REPORT REJECTED` — the open worked but the LED report did not; usually the same device stall.
+
+A quick check on whether the ping really reaches the device: the NumLock LED blinks once per
+interval. If it does, the transfer is real. `keykeep probe` shows the same thing in numbers.
 
 A quick check on whether the ping really reaches the device: the NumLock LED blinks once per
 interval. If it does, the transfer is real.
