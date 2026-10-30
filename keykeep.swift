@@ -128,28 +128,38 @@ func pickInterface(_ devs: [IOHIDDevice]) -> IOHIDDevice? {
     return devs.max { score($0) < score($1) }
 }
 
-enum Cancel: Error {
-    case absent
-    case denied(IOReturn)
-    case openFailed(IOReturn)
+/// The keyboard as we opened it, plus what the open cost in milliseconds.
+struct Opened {
+    let dev: IOHIDDevice
+    let manager: IOHIDManager
+    let ms: Int
 }
 
-/// Open the keyboard. Returns the chosen interface plus the millisecond cost of the open.
-func openKeyboard() -> Result<(dev: IOHIDDevice, manager: IOHIDManager, ms: Int), Cancel> {
+/// Why an open failed, and how long the attempt took — a wedged device costs seconds, a denial is instant.
+struct OpenFailure: Error {
+    enum Kind { case absent, denied, openFailed }
+    let kind: Kind
+    let code: IOReturn?
+    let ms: Int
+}
+
+/// Open the keyboard. The millisecond cost matters as much as the outcome: a stalled open is the
+/// signature of a device that enumerates but does not answer control transfers.
+func openKeyboard() -> Result<Opened, OpenFailure> {
     let t0 = Date()
     let m = newManager(vid: KB_VID, pid: KB_PID)
     let r = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeNone))
     let ms = Int(Date().timeIntervalSince(t0) * 1000)
     if r != kIOReturnSuccess {
         IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
-        return .failure(r == kIOReturnNotPermitted ? .denied(r) : .openFailed(r))
+        return .failure(OpenFailure(kind: r == kIOReturnNotPermitted ? .denied : .openFailed, code: r, ms: ms))
     }
     let devs = devices(m)
     guard let dev = pickInterface(devs) else {
         IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
-        return .failure(.absent)
+        return .failure(OpenFailure(kind: .absent, code: nil, ms: ms))
     }
-    return .success((dev, m, ms))
+    return .success(Opened(dev: dev, manager: m, ms: ms))
 }
 
 // MARK: - One attempt
@@ -174,24 +184,26 @@ var ledState = false
 
 func ledAttempt() -> Attempt {
     switch openKeyboard() {
-    case .failure(.absent):
-        return Attempt(outcome: .absent, detail: "keyboard not present on the bus", ms: 0)
-    case .failure(.denied(let r)):
-        return Attempt(outcome: .noAccess,
-                       detail: "open denied \(hex(Int(r))) \(iorName(r))", ms: 0)
-    case .failure(.openFailed(let r)):
-        return Attempt(outcome: .openFailed,
-                       detail: "open failed \(hex(Int(r))) \(iorName(r))", ms: 0)
-    case .success(let (dev, m, openMs)):
-        defer { IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone)) }
+    case .failure(let f):
+        let code = f.code.map { "\(hex(Int($0))) \(iorName($0))" } ?? "-"
+        switch f.kind {
+        case .absent:
+            return Attempt(outcome: .absent, detail: "keyboard not present on the bus", ms: f.ms)
+        case .denied:
+            return Attempt(outcome: .noAccess, detail: "open denied \(code)", ms: f.ms)
+        case .openFailed:
+            return Attempt(outcome: .openFailed, detail: "open failed \(code)", ms: f.ms)
+        }
+    case .success(let o):
+        defer { IOHIDManagerClose(o.manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
         ledState.toggle()
         var report: [UInt8] = [ledState ? 0x01 : 0x00]   // bit0 = NumLock, no report ID
         let t0 = Date()
         let r = report.withUnsafeMutableBufferPointer { buf in
-            IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, buf.baseAddress!, buf.count)
+            IOHIDDeviceSetReport(o.dev, kIOHIDReportTypeOutput, 0, buf.baseAddress!, buf.count)
         }
-        let ms = openMs + Int(Date().timeIntervalSince(t0) * 1000)
-        let where_ = "usagePage \(usagePage(dev))/usage \(usage(dev))"
+        let ms = o.ms + Int(Date().timeIntervalSince(t0) * 1000)
+        let where_ = "usagePage \(usagePage(o.dev))/usage \(usage(o.dev))"
         if r == kIOReturnSuccess {
             return Attempt(outcome: .ok, detail: "LED \(ledState ? "on" : "off") via \(where_)", ms: ms)
         }
@@ -313,15 +325,19 @@ func requestProbe() -> (usb: Int, hid: Int, codes: [String]) {
     return (usbCount, hidCount, codes)
 }
 
-func describeOpen(_ r: Result<(dev: IOHIDDevice, manager: IOHIDManager, ms: Int), Cancel>) -> String {
+func describeOpen(_ r: Result<Opened, OpenFailure>) -> String {
     switch r {
-    case .success(let (dev, m, ms)):
-        let s = "opens in \(ms) ms (\(describe(dev)))"
-        IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
+    case .success(let o):
+        let s = "opens in \(o.ms) ms (\(describe(o.dev)))"
+        IOHIDManagerClose(o.manager, IOOptionBits(kIOHIDOptionsTypeNone))
         return s
-    case .failure(.absent):           return "not present on the bus"
-    case .failure(.denied(let e)):    return "no access \(hex(Int(e))) \(iorName(e))"
-    case .failure(.openFailed(let e)): return "open failed \(hex(Int(e))) \(iorName(e))"
+    case .failure(let f):
+        let code = f.code.map { "\(hex(Int($0))) \(iorName($0))" } ?? "-"
+        switch f.kind {
+        case .absent:     return "not present on the bus (\(f.ms) ms)"
+        case .denied:     return "no access \(code) (\(f.ms) ms)"
+        case .openFailed: return "open failed \(code) (\(f.ms) ms)"
+        }
     }
 }
 
@@ -345,15 +361,19 @@ func cmdStatus() -> Int32 {
     print("binary           : \(CommandLine.arguments[0])")
     fflush(stdout)
     switch openKeyboard() {
-    case .success(let (dev, m, ms)):
-        print("keyboard         : open in \(ms) ms — \(describe(dev))")
-        IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
-    case .failure(.absent):
-        print("keyboard         : NOT PRESENT on the bus")
-    case .failure(.denied(let r)):
-        print("keyboard         : no Input Monitoring access (\(hex(Int(r))) \(iorName(r)))")
-    case .failure(.openFailed(let r)):
-        print("keyboard         : open failed (\(hex(Int(r))) \(iorName(r)))")
+    case .success(let o):
+        print("keyboard         : open in \(o.ms) ms — \(describe(o.dev))")
+        IOHIDManagerClose(o.manager, IOOptionBits(kIOHIDOptionsTypeNone))
+    case .failure(let f):
+        let code = f.code.map { "\(hex(Int($0))) \(iorName($0))" } ?? "-"
+        switch f.kind {
+        case .absent:
+            print("keyboard         : NOT PRESENT on the bus (\(f.ms) ms)")
+        case .denied:
+            print("keyboard         : no Input Monitoring access (\(code), \(f.ms) ms)")
+        case .openFailed:
+            print("keyboard         : open failed (\(code)) after \(f.ms) ms")
+        }
     }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
