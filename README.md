@@ -50,6 +50,22 @@ The row normally appears in the list by itself once the bundle has been launched
 open -a ./Keykeep.app
 ```
 
+### After a rebuild: the grant goes stale
+
+The grant is stored against the **code hash**. Rebuilding keeps the app name and the entry in the
+list, but the stored requirement no longer matches what runs — so the switch still looks enabled
+while the daemon gets `kIOReturnNotPermitted`. Toggling that switch does nothing, because macOS
+considers it already on. Clear the entry and let the app ask again:
+
+```sh
+tccutil reset ListenEvent local.keykeep.app
+open -a ./Keykeep.app
+launchctl kickstart -k gui/$(id -u)/local.keykeep.agent
+```
+
+`open` launches the bundle, which requests the permission itself; the fresh entry is then granted
+and the agent's next tick reports `state: OK`. No manual list editing needed.
+
 ## Configuration
 
 The keyboard is matched by two constants at the top of `keykeep.swift`:
@@ -128,7 +144,7 @@ What they mean:
   replug. The agent then backs off to `--backoff` seconds instead of hammering a 30-second stall
   every cycle.
 * `NO ACCESS — kIOReturnNotPermitted` — Input Monitoring is not granted. Note the grant is tied to
-  the **code hash**, so any rebuild silently revokes it: toggle the permission off and on again.
+  the **code hash**, so any rebuild silently revokes it: see "After a rebuild: the grant goes stale".
 * `REPORT REJECTED` — the open worked but the LED report did not; usually the same device stall.
 
 A quick check on whether the ping really reaches the device: the NumLock LED blinks once per
