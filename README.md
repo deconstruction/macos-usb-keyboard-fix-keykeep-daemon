@@ -95,9 +95,10 @@ INTERVAL=2 ./install.sh
 ## Commands
 
 ```
-keykeep poke [--interval 5] [--backoff 60] [--led | --key 71] [--log PATH]   keep-alive loop
+keykeep poke [--interval 5] [--backoff 60] [--recover-every 300] [--led | --key 71] [--log PATH]
 keykeep once                                                  one poke, prints what happened and how long it took
 keykeep probe                                                 open every interface separately, with timings
+keykeep recover                                               ask the kernel to re-probe the keyboard
 keykeep watch                                                 log attach/detach of the keyboard
 keykeep devices                                               list HID devices with usage page and LED elements
 keykeep status                                                permissions, presence, chosen interface
@@ -146,9 +147,37 @@ What they mean:
 * `NO ACCESS — kIOReturnNotPermitted` — Input Monitoring is not granted. Note the grant is tied to
   the **code hash**, so any rebuild silently revokes it: see "After a rebuild: the grant goes stale".
 * `REPORT REJECTED` — the open worked but the LED report did not; usually the same device stall.
+* `re-probe: asked 1 USB and 2 HID node(s)` followed by `kIOReturnUnsupported` — see
+  "Can the port be reset from software?": the call is made and gets nothing back.
 
 A quick check on whether the ping really reaches the device: the NumLock LED blinks once per
 interval. If it does, the transfer is real. `keykeep probe` shows the same thing in numbers.
+
+## Can the port be reset from software?
+
+No. macOS exposes neither port power nor port reset to user space — there is no counterpart to
+Linux's `usbreset` or `/sys/bus/usb/.../authorized`. What was actually tried on this machine:
+
+* `IOServiceRequestProbe` on the `IOUSBHostDevice` node and on both `IOHIDDevice` interfaces returns
+  `kIOReturnUnsupported`: the drivers do not implement re-probing. `keykeep recover` calls it anyway
+  because it is harmless, logs the codes, and prints the device state before and after — the result
+  is evidence, not a fix. The agent calls the same thing once every `--recover-every` seconds while
+  the device is unwedged-looking, and the log records what came back.
+* reloading `com.apple.driver.usb.IOUSBHostHIDDevice` was not attempted: Apple kernel extensions live
+  in the boot kernel collection and are not unloadable on Apple Silicon, and it would take the
+  built-in keyboard down with it.
+* a full sleep/wake cycle *does* power-cycle the ports, but that contradicts the reason this daemon
+  exists.
+
+So when a device wedges, the honest options are a physical replug or hardware that can cut power
+(a powered hub on a switchable socket).
+
+## Recovering a wedged device
+
+`OPEN FAILED` with a multi-second figure, or `REPORT REJECTED`, means the keyboard still enumerates
+but does not answer control transfers. `keykeep recover` records exactly that, and
+`keykeep probe` distinguishes it from a permission problem: a denied open fails in 0 ms, a wedged
+device stalls and then fails.
 
 A quick check on whether the ping really reaches the device: the NumLock LED blinks once per
 interval. If it does, the transfer is real.

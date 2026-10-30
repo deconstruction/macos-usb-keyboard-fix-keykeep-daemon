@@ -273,6 +273,72 @@ func cmdProbe() -> Int32 {
     return 0
 }
 
+// MARK: - Recovery (safe path only: IOServiceRequestProbe)
+
+func services(_ className: String, vidKey: String, pidKey: String) -> [io_service_t] {
+    var iter: io_iterator_t = 0
+    guard let match = IOServiceMatching(className) else { return [] }
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter) == KERN_SUCCESS else { return [] }
+    defer { IOObjectRelease(iter) }
+    var found: [io_service_t] = []
+    var svc = IOIteratorNext(iter)
+    while svc != 0 {
+        let v = (IORegistryEntryCreateCFProperty(svc, vidKey as CFString, kCFAllocatorDefault, 0)?
+                    .takeRetainedValue() as? NSNumber)?.intValue ?? -1
+        let p = (IORegistryEntryCreateCFProperty(svc, pidKey as CFString, kCFAllocatorDefault, 0)?
+                    .takeRetainedValue() as? NSNumber)?.intValue ?? -1
+        if v == KB_VID && p == KB_PID { found.append(svc) } else { IOObjectRelease(svc) }
+        svc = IOIteratorNext(iter)
+    }
+    return found
+}
+
+/// Ask the kernel to re-probe the keyboard's nodes. Safe: no driver reload, no port power cycling,
+/// no seize — if the driver has nothing to re-probe this is a no-op with a return code.
+func requestProbe() -> (usb: Int, hid: Int, codes: [String]) {
+    var codes: [String] = []
+    var usbCount = 0, hidCount = 0
+    for s in services("IOUSBHostDevice", vidKey: "idVendor", pidKey: "idProduct") {
+        let r = IOServiceRequestProbe(s, 0)
+        codes.append("IOUSBHostDevice: \(hex(Int(r))) \(iorName(r))")
+        usbCount += 1
+        IOObjectRelease(s)
+    }
+    for s in services("IOHIDDevice", vidKey: kIOHIDVendorIDKey, pidKey: kIOHIDProductIDKey) {
+        let r = IOServiceRequestProbe(s, 0)
+        codes.append("IOHIDDevice: \(hex(Int(r))) \(iorName(r))")
+        hidCount += 1
+        IOObjectRelease(s)
+    }
+    return (usbCount, hidCount, codes)
+}
+
+func describeOpen(_ r: Result<(dev: IOHIDDevice, manager: IOHIDManager, ms: Int), Cancel>) -> String {
+    switch r {
+    case .success(let (dev, m, ms)):
+        let s = "opens in \(ms) ms (\(describe(dev)))"
+        IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
+        return s
+    case .failure(.absent):           return "not present on the bus"
+    case .failure(.denied(let e)):    return "no access \(hex(Int(e))) \(iorName(e))"
+    case .failure(.openFailed(let e)): return "open failed \(hex(Int(e))) \(iorName(e))"
+    }
+}
+
+func cmdRecover() -> Int32 {
+    out("recover: before — \(describeOpen(openKeyboard()))")
+    let p = requestProbe()
+    if p.usb + p.hid == 0 {
+        out("recover: no kernel nodes for this keyboard — nothing to re-probe")
+        return 1
+    }
+    out("recover: re-probe requested for \(p.usb) USB and \(p.hid) HID node(s)")
+    for c in p.codes { out("  \(c)") }
+    Thread.sleep(forTimeInterval: 0.5)
+    out("recover: after — \(describeOpen(openKeyboard()))")
+    return 0
+}
+
 func cmdStatus() -> Int32 {
     print("input monitoring : \(CGPreflightListenEventAccess())")
     print("accessibility    : \(AXIsProcessTrusted())")
@@ -380,6 +446,7 @@ func rotateLog(_ path: String) {
 func cmdPoke(args: [String]) -> Int32 {
     var interval = 5.0
     var backoff = 60.0
+    var recoverEvery = 300.0
     var keyCode: CGKeyCode? = nil
     var logPath: String? = nil
     var i = 0
@@ -391,6 +458,9 @@ func cmdPoke(args: [String]) -> Int32 {
         case "--backoff":
             i += 1
             if i < args.count, let v = Double(args[i]), v >= 1 { backoff = v }
+        case "--recover-every":
+            i += 1
+            if i < args.count, let v = Double(args[i]), v >= 0 { recoverEvery = v }
         case "--key":
             i += 1
             if i < args.count, let v = UInt16(args[i]) { keyCode = CGKeyCode(v) }
@@ -407,7 +477,7 @@ func cmdPoke(args: [String]) -> Int32 {
     if let lp = logPath { rotateLog(lp) }
 
     let mode = keyCode.map { "key \($0) injection (no USB traffic)" } ?? "LED report over USB"
-    out("keykeep starting: every \(interval)s (backoff \(backoff)s) -> \(mode)")
+    out("keykeep starting: every \(interval)s (backoff \(backoff)s, re-probe every \(Int(recoverEvery))s) -> \(mode)")
 
     signal(SIGTERM) { _ in exit(0) }
     signal(SIGINT) { _ in exit(0) }
@@ -417,6 +487,7 @@ func cmdPoke(args: [String]) -> Int32 {
     var inBackoff = false
     var lastLoggedAt = Date.distantPast
     var lastDetail = ""
+    var lastRecoverAt = Date.distantPast
 
     while true {
         tick += 1
@@ -448,6 +519,20 @@ func cmdPoke(args: [String]) -> Int32 {
             out("recovered — back to \(Int(interval))s")
         }
 
+        // устройство заклинило или пропало: вежливо просим ядро переопросить его узлы.
+        // Это безопасный вызов — перезагрузки драйвера и питания порта здесь нет.
+        if (a.outcome == .openFailed || a.outcome == .absent) && recoverEvery > 0,
+           Date().timeIntervalSince(lastRecoverAt) >= recoverEvery {
+            lastRecoverAt = Date()
+            let p = requestProbe()
+            if p.usb + p.hid == 0 {
+                out("re-probe: no kernel nodes for the keyboard")
+            } else {
+                out("re-probe: asked \(p.usb) USB and \(p.hid) HID node(s) to re-probe")
+                for c in p.codes { out("  \(c)") }
+            }
+        }
+
         // периодическая отметка, чтобы в логе была видна жизнь
         let due = Date().timeIntervalSince(lastLoggedAt) >= 60
         if due && a.outcome != .ok {
@@ -468,10 +553,11 @@ func cmdPoke(args: [String]) -> Int32 {
 func usage() {
     print("""
     keykeep <command>
-      poke [--interval N] [--backoff N] [--led | --key CODE] [--log PATH]
-                                            keep-alive loop (default: --led, 5s, backoff 60s)
+      poke [--interval N] [--backoff N] [--recover-every N] [--led | --key CODE] [--log PATH]
+                                            keep-alive loop (default: --led, 5s, backoff 60s, re-probe 300s)
       once                                  single poke, prints what happened and how long it took
       probe                                 open every interface separately, with timings
+      recover                               ask the kernel to re-probe the keyboard, before/after
       watch                                 log keyboard attach/detach events
       devices                               list HID devices with usage page and LED elements
       status                                permissions, presence, chosen interface
@@ -489,6 +575,7 @@ switch cmd {
 case "poke":    exit(cmdPoke(args: Array(argv.dropFirst())))
 case "once":    exit(cmdOnce())
 case "probe":   exit(cmdProbe())
+case "recover": exit(cmdRecover())
 case "watch":   exit(cmdWatch())
 case "devices": exit(cmdDevices())
 case "status":  exit(cmdStatus())
